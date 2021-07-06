@@ -28,10 +28,6 @@ type Writer struct {
 	data      []byte        // Data to be compressed + buffer for compressed data.
 	idx       int           // Index into data.
 	hashtable [winSize]int  // Hash table used in CompressBlock().
-
-	// For concurrency.
-	c   chan chan zResult // Channel for block compression goroutines and writer goroutine.
-	err error             // Any error encountered while writing to the underlying destination.
 }
 
 // NewWriter returns a new LZ4 frame encoder.
@@ -175,18 +171,6 @@ func (z *Writer) compressBlock(data []byte) error {
 		_, _ = z.checksum.Write(data)
 	}
 
-	if z.c != nil {
-		c := make(chan zResult)
-		z.c <- c // Send now to guarantee order
-
-		// get a buffer from the pool and copy the data over
-		block := getBuffer(z.Header.BlockMaxSize)[:len(data)]
-		copy(block, data)
-
-		go writerCompressBlock(c, z.Header, block)
-		return nil
-	}
-
 	zdata := z.data[z.Header.BlockMaxSize:cap(z.data)]
 	// The compressed block size cannot exceed the input's.
 	var zn int
@@ -255,31 +239,11 @@ func (z *Writer) Flush() error {
 	copy(data, z.data[:z.idx])
 
 	z.idx = 0
-	if z.c == nil {
-		return z.compressBlock(data)
-	}
-	if !z.NoChecksum {
-		_, _ = z.checksum.Write(data)
-	}
-	c := make(chan zResult)
-	z.c <- c
-	writerCompressBlock(c, z.Header, data)
-	return nil
+	return z.compressBlock(data)
 }
 
 func (z *Writer) close() error {
-	if z.c == nil {
-		return nil
-	}
-	// Send a sentinel block (no data to compress) to terminate the writer main goroutine.
-	c := make(chan zResult)
-	z.c <- c
-	c <- zResult{}
-	// Wait for the main goroutine to complete.
-	<-c
-	// At this point the main goroutine has shut down or is about to return.
-	z.c = nil
-	return z.err
+	return nil
 }
 
 // Close closes the Writer, flushing any unwritten data to the underlying io.Writer, but does not close the underlying io.Writer.
@@ -323,7 +287,6 @@ func (z *Writer) Reset(w io.Writer) {
 	z.dst = w
 	z.checksum.Reset()
 	z.idx = 0
-	z.err = nil
 	// reset hashtable to ensure deterministic output.
 	for i := range z.hashtable {
 		z.hashtable[i] = 0
